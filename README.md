@@ -87,10 +87,11 @@ For distributions using a different OBS plugin directory, copy
 2. Leave `Audio Source` as `Auto: all audio sources` to visualize whatever OBS is
    currently playing, or choose a specific source.
 3. Resize the source directly in the OBS scene preview. With `Resize
-   Width/Height From Scene Transform` enabled, dragging the scene item updates
-   the lightbar's real width and height; non-uniform resizing changes its aspect
-   ratio. Use the `Width` and `Height` fields for an initial or exact numeric
-   size.
+   Width/Height From Scene Transform` enabled, selecting the item switches it to
+   OBS stretch-bounds resizing, so edge and corner handles can change width,
+   height, and aspect ratio independently. The plugin saves that scene box back
+   into its real `Width` and `Height`; use those fields for an initial or exact
+   numeric size.
 4. Choose `Render Style`: `Stacked Brick` is the default, and `Smooth` restores
    the original continuous bars.
 5. Adjust `Bars`, `Brick Rows`, `Spectrum Updates Per Second`, and

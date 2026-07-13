@@ -29,6 +29,7 @@ OBS_DECLARE_MODULE()
 #define ATTACH_REFRESH_SECONDS 2.0f
 #define SCENE_RESIZE_SYNC_SECONDS 0.10f
 #define RESIZE_SCALE_EPSILON 0.003f
+#define RESIZE_DIMENSION_EPSILON 0.5f
 #define MAX_ANALYSIS_SAMPLES 1024u
 #define DEFAULT_MIN_FREQUENCY 60.0
 #define DEFAULT_MAX_FREQUENCY 5000.0
@@ -530,11 +531,24 @@ static bool find_selected_lightbar_scene(void *param, obs_source_t *source)
 	return find->item == NULL;
 }
 
+static float normalized_scene_scale(float scale)
+{
+	return scale < 0.0f ? -1.0f : 1.0f;
+}
+
 static uint32_t scaled_dimension(uint32_t base, float scale, uint32_t min_value)
 {
 	const float dimension = (float)base * fabsf(scale);
 	if (!isfinite(dimension))
 		return base;
+
+	return clamp_u32((uint32_t)roundf(dimension), min_value, MAX_SOURCE_DIMENSION);
+}
+
+static uint32_t bounded_dimension(float dimension, uint32_t fallback, uint32_t min_value)
+{
+	if (!isfinite(dimension) || dimension <= 0.0f)
+		return fallback;
 
 	return clamp_u32((uint32_t)roundf(dimension), min_value, MAX_SOURCE_DIMENSION);
 }
@@ -570,11 +584,6 @@ static void lightbar_sync_scene_resize(struct lightbar_source *lb)
 	if (fabsf(scale_x) <= RESIZE_SCALE_EPSILON || fabsf(scale_y) <= RESIZE_SCALE_EPSILON)
 		return;
 
-	const bool changed_x = fabsf(fabsf(scale_x) - 1.0f) > RESIZE_SCALE_EPSILON;
-	const bool changed_y = fabsf(fabsf(scale_y) - 1.0f) > RESIZE_SCALE_EPSILON;
-	if (!changed_x && !changed_y)
-		return;
-
 	uint32_t width;
 	uint32_t height;
 
@@ -583,21 +592,53 @@ static void lightbar_sync_scene_resize(struct lightbar_source *lb)
 	height = lb->height;
 	pthread_mutex_unlock(&lb->lock);
 
-	const uint32_t new_width = scaled_dimension(width, scale_x, MIN_SOURCE_WIDTH);
-	const uint32_t new_height = scaled_dimension(height, scale_y, MIN_SOURCE_HEIGHT);
+	uint32_t new_width = width;
+	uint32_t new_height = height;
+	const bool has_bounds = info.bounds_type != OBS_BOUNDS_NONE && info.bounds.x > 0.0f &&
+				info.bounds.y > 0.0f;
 
-	pthread_mutex_lock(&lb->lock);
-	lb->width = new_width;
-	lb->height = new_height;
-	pthread_mutex_unlock(&lb->lock);
+	if (has_bounds) {
+		new_width = bounded_dimension(info.bounds.x, width, MIN_SOURCE_WIDTH);
+		new_height = bounded_dimension(info.bounds.y, height, MIN_SOURCE_HEIGHT);
+	} else {
+		const bool changed_x = fabsf(fabsf(scale_x) - 1.0f) > RESIZE_SCALE_EPSILON;
+		const bool changed_y = fabsf(fabsf(scale_y) - 1.0f) > RESIZE_SCALE_EPSILON;
 
-	info.scale.x = scale_x < 0.0f ? -1.0f : 1.0f;
-	info.scale.y = scale_y < 0.0f ? -1.0f : 1.0f;
+		if (changed_x)
+			new_width = scaled_dimension(width, scale_x, MIN_SOURCE_WIDTH);
+		if (changed_y)
+			new_height = scaled_dimension(height, scale_y, MIN_SOURCE_HEIGHT);
+	}
+
+	const bool dimensions_changed = new_width != width || new_height != height;
+	const bool transform_needs_sync =
+		info.bounds_type != OBS_BOUNDS_STRETCH ||
+		fabsf(info.bounds.x - (float)new_width) > RESIZE_DIMENSION_EPSILON ||
+		fabsf(info.bounds.y - (float)new_height) > RESIZE_DIMENSION_EPSILON ||
+		fabsf(fabsf(info.scale.x) - 1.0f) > RESIZE_SCALE_EPSILON ||
+		fabsf(fabsf(info.scale.y) - 1.0f) > RESIZE_SCALE_EPSILON;
+
+	if (!dimensions_changed && !transform_needs_sync)
+		return;
+
+	if (dimensions_changed) {
+		pthread_mutex_lock(&lb->lock);
+		lb->width = new_width;
+		lb->height = new_height;
+		pthread_mutex_unlock(&lb->lock);
+	}
+
+	info.bounds_type = OBS_BOUNDS_STRETCH;
+	info.bounds.x = (float)new_width;
+	info.bounds.y = (float)new_height;
+	info.scale.x = normalized_scene_scale(scale_x);
+	info.scale.y = normalized_scene_scale(scale_y);
 	obs_sceneitem_defer_update_begin(find.item);
 	obs_sceneitem_set_info2(find.item, &info);
 	obs_sceneitem_defer_update_end(find.item);
 
-	lightbar_store_dimensions(lb, new_width, new_height);
+	if (dimensions_changed)
+		lightbar_store_dimensions(lb, new_width, new_height);
 }
 
 static const char *lightbar_get_name(void *unused)
