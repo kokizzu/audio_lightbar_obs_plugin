@@ -15,7 +15,7 @@ to an old Winamp-style visualizer.
 - Auto mode listens to all current OBS audio sources while the visualizer is
   visible.
 - Optional specific audio source selection.
-- Log-spaced frequency bands, defaulting to 60 Hz through 16 kHz.
+- Log-spaced frequency bands, defaulting to 60 Hz through 5 kHz.
 - `Stacked Brick` render style by default, with an optional `Smooth` original
   bar style.
 - Lightweight Goertzel spectrum analysis with fixed-size buffers: no per-frame
@@ -92,8 +92,8 @@ For distributions using a different OBS plugin directory, copy
 4. Adjust `Bars`, `Brick Rows`, `Spectrum Updates Per Second`, and
    `Sensitivity` if needed. `Brick Rows` is configurable from `10` to `100`.
 5. Use `Lowest Frequency (default: 60 Hz)` and `Highest Frequency (default:
-   16 kHz)` to choose which spectrum range fills the bars. Lower `Highest
-   Frequency` if the rightmost bars rarely move.
+   5 kHz)` to choose which spectrum range fills the bars. Raise `Highest
+   Frequency` if you want more high-frequency music detail.
 6. By default, frequencies below `Lowest Frequency` feed the first bar and
    frequencies above `Highest Frequency` feed the last bar. Enable
    `Ignore Outside Frequency Range` to discard those outside frequencies
@@ -106,3 +106,18 @@ closer to zero, for example from `-72` to `-60`. Lower `Bars` and
 `Spectrum Updates Per Second` if you want the lowest possible CPU use. The
 bars are drawn as brick segments based on the source width and height; resizing
 the OBS scene item scales that brick area in the preview.
+
+## Frequency Notes
+
+Human hearing is roughly `20 Hz` to `20 kHz`, but speech and stream audio usually
+look more useful with a narrower visual range. Human speech fundamentals are
+commonly around `85 Hz` to `255 Hz`, while much of speech clarity sits from a few
+hundred hertz up to about `4 kHz`; the default `60 Hz` to `5 kHz` range keeps the
+bars focused on that active area.
+
+The bars are split on a logarithmic scale, so each step represents a frequency
+ratio instead of a fixed number of hertz. That gives roughly even visual space
+per octave. By default, frequencies below the selected range are folded into the
+first bar and frequencies above the selected range are folded into the last bar.
+Enable `Ignore Outside Frequency Range` if you want those outside frequencies to
+be discarded instead.

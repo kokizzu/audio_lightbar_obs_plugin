@@ -24,7 +24,7 @@ OBS_DECLARE_MODULE()
 #define ATTACH_REFRESH_SECONDS 2.0f
 #define MAX_ANALYSIS_SAMPLES 1024u
 #define DEFAULT_MIN_FREQUENCY 60.0
-#define DEFAULT_MAX_FREQUENCY 16000.0
+#define DEFAULT_MAX_FREQUENCY 5000.0
 #define DEFAULT_NOISE_FLOOR_DB -72.0
 #define TWO_PI 6.28318530717958647692f
 
@@ -914,7 +914,7 @@ static obs_properties_t *lightbar_get_properties(void *data)
 	obs_properties_add_float_slider(props, "decay", "Bar Decay Per Second", 0.0, 6.0, 0.05);
 	obs_properties_add_float_slider(props, "cap_decay", "Peak Cap Decay Per Second", 0.0, 3.0, 0.05);
 	obs_properties_add_float(props, "min_frequency", "Lowest Frequency (default: 60 Hz)", 20.0, 2000.0, 1.0);
-	obs_properties_add_float(props, "max_frequency", "Highest Frequency (default: 16 kHz)", 1000.0, 22000.0,
+	obs_properties_add_float(props, "max_frequency", "Highest Frequency (default: 5 kHz)", 1000.0, 22000.0,
 				 10.0);
 	obs_properties_add_float_slider(props, "noise_floor_db", "Noise Floor dB", -96.0, -24.0, 1.0);
 	obs_properties_add_bool(props, "ignore_outside_frequency_range",
