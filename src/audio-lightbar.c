@@ -16,12 +16,19 @@ OBS_DECLARE_MODULE()
 #define MAX_BARS 256
 #define MIN_BARS 8
 #define DEFAULT_BARS 96
+#define MIN_SOURCE_WIDTH 32
+#define MIN_SOURCE_HEIGHT 16
+#define MAX_SOURCE_DIMENSION 8192
+#define DEFAULT_SOURCE_WIDTH 900
+#define DEFAULT_SOURCE_HEIGHT 220
 #define MIN_BRICK_ROWS 10
 #define MAX_BRICK_ROWS 100
 #define DEFAULT_BRICK_ROWS 24
 #define STYLE_BRICK 0
 #define STYLE_SMOOTH 1
 #define ATTACH_REFRESH_SECONDS 2.0f
+#define SCENE_RESIZE_SYNC_SECONDS 0.10f
+#define RESIZE_SCALE_EPSILON 0.003f
 #define MAX_ANALYSIS_SAMPLES 1024u
 #define DEFAULT_MIN_FREQUENCY 60.0
 #define DEFAULT_MAX_FREQUENCY 5000.0
@@ -53,6 +60,7 @@ struct lightbar_source {
 	bool reverse_rainbow;
 	bool vertical_rainbow;
 	bool ignore_outside_frequency_range;
+	bool resize_from_scene;
 	double sensitivity;
 	double decay;
 	double cap_decay;
@@ -64,11 +72,17 @@ struct lightbar_source {
 	float caps[MAX_BARS];
 	uint32_t analysis_frame_accumulator;
 	float refresh_accumulator;
+	float resize_sync_accumulator;
 };
 
 struct list_audio_sources_param {
 	obs_property_t *property;
 	obs_source_t *self;
+};
+
+struct scene_resize_find_param {
+	struct lightbar_source *lb;
+	obs_sceneitem_t *item;
 };
 
 static float clamp_float(float value, float min_value, float max_value)
@@ -479,6 +493,113 @@ static bool add_audio_source_to_property(void *param, obs_source_t *source)
 	return true;
 }
 
+static bool find_selected_lightbar_sceneitem(obs_scene_t *scene, obs_sceneitem_t *item, void *param)
+{
+	(void)scene;
+
+	struct scene_resize_find_param *find = param;
+	if (find->item)
+		return false;
+
+	obs_source_t *item_source = obs_sceneitem_get_source(item);
+	if (item_source == find->lb->source && obs_sceneitem_selected(item)) {
+		find->item = item;
+		return false;
+	}
+
+	if (obs_sceneitem_is_group(item)) {
+		obs_sceneitem_group_enum_items(item, find_selected_lightbar_sceneitem, param);
+		if (find->item)
+			return false;
+	}
+
+	return true;
+}
+
+static bool find_selected_lightbar_scene(void *param, obs_source_t *source)
+{
+	struct scene_resize_find_param *find = param;
+	if (find->item)
+		return false;
+
+	obs_scene_t *scene = obs_scene_from_source(source);
+	if (!scene)
+		return true;
+
+	obs_scene_enum_items(scene, find_selected_lightbar_sceneitem, param);
+	return find->item == NULL;
+}
+
+static uint32_t scaled_dimension(uint32_t base, float scale, uint32_t min_value)
+{
+	const float dimension = (float)base * fabsf(scale);
+	if (!isfinite(dimension))
+		return base;
+
+	return clamp_u32((uint32_t)roundf(dimension), min_value, MAX_SOURCE_DIMENSION);
+}
+
+static void lightbar_store_dimensions(struct lightbar_source *lb, uint32_t width, uint32_t height)
+{
+	obs_data_t *settings = obs_source_get_settings(lb->source);
+	if (!settings)
+		return;
+
+	obs_data_set_int(settings, "width", width);
+	obs_data_set_int(settings, "height", height);
+	obs_source_update(lb->source, settings);
+	obs_data_release(settings);
+}
+
+static void lightbar_sync_scene_resize(struct lightbar_source *lb)
+{
+	struct scene_resize_find_param find = {
+		.lb = lb,
+		.item = NULL,
+	};
+
+	obs_enum_scenes(find_selected_lightbar_scene, &find);
+	if (!find.item)
+		return;
+
+	struct obs_transform_info info;
+	obs_sceneitem_get_info2(find.item, &info);
+
+	const float scale_x = info.scale.x;
+	const float scale_y = info.scale.y;
+	if (fabsf(scale_x) <= RESIZE_SCALE_EPSILON || fabsf(scale_y) <= RESIZE_SCALE_EPSILON)
+		return;
+
+	const bool changed_x = fabsf(fabsf(scale_x) - 1.0f) > RESIZE_SCALE_EPSILON;
+	const bool changed_y = fabsf(fabsf(scale_y) - 1.0f) > RESIZE_SCALE_EPSILON;
+	if (!changed_x && !changed_y)
+		return;
+
+	uint32_t width;
+	uint32_t height;
+
+	pthread_mutex_lock(&lb->lock);
+	width = lb->width;
+	height = lb->height;
+	pthread_mutex_unlock(&lb->lock);
+
+	const uint32_t new_width = scaled_dimension(width, scale_x, MIN_SOURCE_WIDTH);
+	const uint32_t new_height = scaled_dimension(height, scale_y, MIN_SOURCE_HEIGHT);
+
+	pthread_mutex_lock(&lb->lock);
+	lb->width = new_width;
+	lb->height = new_height;
+	pthread_mutex_unlock(&lb->lock);
+
+	info.scale.x = scale_x < 0.0f ? -1.0f : 1.0f;
+	info.scale.y = scale_y < 0.0f ? -1.0f : 1.0f;
+	obs_sceneitem_defer_update_begin(find.item);
+	obs_sceneitem_set_info2(find.item, &info);
+	obs_sceneitem_defer_update_end(find.item);
+
+	lightbar_store_dimensions(lb, new_width, new_height);
+}
+
 static const char *lightbar_get_name(void *unused)
 {
 	(void)unused;
@@ -489,16 +610,22 @@ static void lightbar_update(void *data, obs_data_t *settings)
 {
 	struct lightbar_source *lb = data;
 	const char *source_name = obs_data_get_string(settings, "audio_source");
+	const char *new_source_name = source_name ? source_name : "";
 	const uint32_t bar_count =
 		clamp_u32((uint32_t)obs_data_get_int(settings, "bar_count"), MIN_BARS, MAX_BARS);
+	bool audio_selection_changed;
 
 	pthread_mutex_lock(&lb->lock);
+	audio_selection_changed =
+		!lb->audio_source_name || strcmp(lb->audio_source_name, new_source_name) != 0;
 	bfree(lb->audio_source_name);
-	lb->audio_source_name = bstrdup(source_name ? source_name : "");
+	lb->audio_source_name = bstrdup(new_source_name);
 	lb->attach_all = !lb->audio_source_name || lb->audio_source_name[0] == '\0';
 
-	lb->width = clamp_u32((uint32_t)obs_data_get_int(settings, "width"), 32, 8192);
-	lb->height = clamp_u32((uint32_t)obs_data_get_int(settings, "height"), 16, 8192);
+	lb->width = clamp_u32((uint32_t)obs_data_get_int(settings, "width"), MIN_SOURCE_WIDTH,
+			      MAX_SOURCE_DIMENSION);
+	lb->height = clamp_u32((uint32_t)obs_data_get_int(settings, "height"), MIN_SOURCE_HEIGHT,
+			       MAX_SOURCE_DIMENSION);
 	lb->bar_count = bar_count;
 	lb->brick_rows =
 		clamp_u32((uint32_t)obs_data_get_int(settings, "brick_rows"), MIN_BRICK_ROWS, MAX_BRICK_ROWS);
@@ -516,6 +643,8 @@ static void lightbar_update(void *data, obs_data_t *settings)
 	lb->reverse_rainbow = obs_data_get_bool(settings, "reverse_rainbow");
 	lb->vertical_rainbow = obs_data_get_bool(settings, "vertical_rainbow");
 	lb->ignore_outside_frequency_range = obs_data_get_bool(settings, "ignore_outside_frequency_range");
+	lb->resize_from_scene = !obs_data_has_user_value(settings, "resize_from_scene") ||
+				obs_data_get_bool(settings, "resize_from_scene");
 
 	if (lb->sensitivity <= 0.0)
 		lb->sensitivity = 1.0;
@@ -534,7 +663,7 @@ static void lightbar_update(void *data, obs_data_t *settings)
 
 	pthread_mutex_unlock(&lb->lock);
 
-	if (obs_source_showing(lb->source))
+	if (audio_selection_changed && obs_source_showing(lb->source))
 		refresh_audio_sources(lb);
 }
 
@@ -592,6 +721,7 @@ static void lightbar_video_tick(void *data, float seconds)
 		return;
 
 	bool should_refresh = false;
+	bool should_sync_resize = false;
 
 	pthread_mutex_lock(&lb->lock);
 
@@ -599,6 +729,16 @@ static void lightbar_video_tick(void *data, float seconds)
 		lb->refresh_accumulator += seconds;
 		if (lb->refresh_accumulator >= ATTACH_REFRESH_SECONDS)
 			should_refresh = true;
+
+		if (lb->resize_from_scene) {
+			lb->resize_sync_accumulator += seconds;
+			if (lb->resize_sync_accumulator >= SCENE_RESIZE_SYNC_SECONDS) {
+				lb->resize_sync_accumulator = 0.0f;
+				should_sync_resize = true;
+			}
+		} else {
+			lb->resize_sync_accumulator = 0.0f;
+		}
 	}
 
 	const float decay_amount = (float)(lb->decay * seconds);
@@ -611,6 +751,9 @@ static void lightbar_video_tick(void *data, float seconds)
 	}
 
 	pthread_mutex_unlock(&lb->lock);
+
+	if (should_sync_resize)
+		lightbar_sync_scene_resize(lb);
 
 	if (should_refresh)
 		refresh_audio_sources(lb);
@@ -840,7 +983,7 @@ static uint32_t lightbar_get_width(void *data)
 {
 	struct lightbar_source *lb = data;
 	if (!lb)
-		return 900;
+		return DEFAULT_SOURCE_WIDTH;
 
 	pthread_mutex_lock(&lb->lock);
 	const uint32_t width = lb->width;
@@ -853,7 +996,7 @@ static uint32_t lightbar_get_height(void *data)
 {
 	struct lightbar_source *lb = data;
 	if (!lb)
-		return 220;
+		return DEFAULT_SOURCE_HEIGHT;
 
 	pthread_mutex_lock(&lb->lock);
 	const uint32_t height = lb->height;
@@ -862,11 +1005,23 @@ static uint32_t lightbar_get_height(void *data)
 	return height;
 }
 
+static void lightbar_save(void *data, obs_data_t *settings)
+{
+	struct lightbar_source *lb = data;
+	if (!lb)
+		return;
+
+	pthread_mutex_lock(&lb->lock);
+	obs_data_set_int(settings, "width", lb->width);
+	obs_data_set_int(settings, "height", lb->height);
+	pthread_mutex_unlock(&lb->lock);
+}
+
 static void lightbar_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "audio_source", "");
-	obs_data_set_default_int(settings, "width", 900);
-	obs_data_set_default_int(settings, "height", 220);
+	obs_data_set_default_int(settings, "width", DEFAULT_SOURCE_WIDTH);
+	obs_data_set_default_int(settings, "height", DEFAULT_SOURCE_HEIGHT);
 	obs_data_set_default_int(settings, "bar_count", DEFAULT_BARS);
 	obs_data_set_default_int(settings, "brick_rows", DEFAULT_BRICK_ROWS);
 	obs_data_set_default_int(settings, "update_rate", 45);
@@ -883,6 +1038,7 @@ static void lightbar_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "reverse_rainbow", false);
 	obs_data_set_default_bool(settings, "vertical_rainbow", false);
 	obs_data_set_default_bool(settings, "ignore_outside_frequency_range", false);
+	obs_data_set_default_bool(settings, "resize_from_scene", true);
 }
 
 static obs_properties_t *lightbar_get_properties(void *data)
@@ -901,8 +1057,10 @@ static obs_properties_t *lightbar_get_properties(void *data)
 	};
 	obs_enum_sources(add_audio_source_to_property, &list);
 
-	obs_properties_add_int(props, "width", "Width", 32, 8192, 1);
-	obs_properties_add_int(props, "height", "Height", 16, 8192, 1);
+	obs_properties_add_int(props, "width", "Width", MIN_SOURCE_WIDTH, MAX_SOURCE_DIMENSION, 1);
+	obs_properties_add_int(props, "height", "Height", MIN_SOURCE_HEIGHT, MAX_SOURCE_DIMENSION, 1);
+	obs_properties_add_bool(props, "resize_from_scene",
+				"Resize Width/Height From Scene Transform (default: on)");
 	obs_property_t *style_list = obs_properties_add_list(props, "render_style", "Render Style",
 							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
 	obs_property_list_add_int(style_list, "Stacked Brick", STYLE_BRICK);
@@ -936,6 +1094,7 @@ static struct obs_source_info lightbar_source_info = {
 	.create = lightbar_create,
 	.destroy = lightbar_destroy,
 	.update = lightbar_update,
+	.save = lightbar_save,
 	.get_defaults = lightbar_get_defaults,
 	.get_properties = lightbar_get_properties,
 	.video_tick = lightbar_video_tick,
