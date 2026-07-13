@@ -17,7 +17,11 @@ OBS_DECLARE_MODULE()
 #define MIN_BARS 8
 #define DEFAULT_BARS 96
 #define ATTACH_REFRESH_SECONDS 2.0f
-#define MAX_SCAN_SAMPLES 2048u
+#define MAX_ANALYSIS_SAMPLES 1024u
+#define DEFAULT_MIN_FREQUENCY 60.0
+#define DEFAULT_MAX_FREQUENCY 16000.0
+#define DEFAULT_NOISE_FLOOR_DB -72.0
+#define TWO_PI 6.28318530717958647692f
 
 struct lightbar_source {
 	obs_source_t *source;
@@ -42,14 +46,15 @@ struct lightbar_source {
 	double sensitivity;
 	double decay;
 	double cap_decay;
+	double min_frequency;
+	double max_frequency;
+	double noise_floor_db;
 
 	float bars[MAX_BARS];
 	float caps[MAX_BARS];
 	struct vec4 colors[MAX_BARS];
 	struct vec4 cap_colors[MAX_BARS];
-	uint32_t write_index;
-	float current_peak;
-	float sample_accumulator;
+	uint32_t analysis_frame_accumulator;
 	float refresh_accumulator;
 };
 
@@ -143,9 +148,7 @@ static void clear_levels(struct lightbar_source *lb)
 {
 	memset(lb->bars, 0, sizeof(lb->bars));
 	memset(lb->caps, 0, sizeof(lb->caps));
-	lb->write_index = 0;
-	lb->current_peak = 0.0f;
-	lb->sample_accumulator = 0.0f;
+	lb->analysis_frame_accumulator = 0;
 }
 
 static bool is_audio_source_candidate(obs_source_t *source, obs_source_t *self)
@@ -179,6 +182,39 @@ static bool attached_sources_push(struct lightbar_source *lb, obs_weak_source_t 
 	return true;
 }
 
+static float goertzel_magnitude(const float *samples, uint32_t count, float frequency, uint32_t sample_rate)
+{
+	if (count == 0 || sample_rate == 0 || frequency <= 0.0f)
+		return 0.0f;
+
+	const float omega = TWO_PI * frequency / (float)sample_rate;
+	const float coeff = 2.0f * cosf(omega);
+	float q0 = 0.0f;
+	float q1 = 0.0f;
+	float q2 = 0.0f;
+
+	for (uint32_t i = 0; i < count; i++) {
+		q0 = coeff * q1 - q2 + samples[i];
+		q2 = q1;
+		q1 = q0;
+	}
+
+	float power = q1 * q1 + q2 * q2 - coeff * q1 * q2;
+	if (power < 0.0f)
+		power = 0.0f;
+
+	return sqrtf(power) * (2.0f / (float)count);
+}
+
+static float magnitude_to_level(float magnitude, float noise_floor_db, float sensitivity)
+{
+	const float db = 20.0f * log10f(magnitude + 0.00000001f);
+	float level = (db - noise_floor_db) / (0.0f - noise_floor_db);
+
+	level = clamp_float(level * sensitivity, 0.0f, 1.0f);
+	return powf(level, 0.72f);
+}
+
 static void audio_capture_callback(void *param, obs_source_t *captured_source,
 				   const struct audio_data *audio_data, bool muted)
 {
@@ -191,6 +227,10 @@ static void audio_capture_callback(void *param, obs_source_t *captured_source,
 	if (!audio)
 		return;
 
+	const uint32_t sample_rate = audio_output_get_sample_rate(audio);
+	if (sample_rate == 0)
+		return;
+
 	size_t channels = audio_output_get_channels(audio);
 	if (channels > MAX_AUDIO_CHANNELS)
 		channels = MAX_AUDIO_CHANNELS;
@@ -199,37 +239,87 @@ static void audio_capture_callback(void *param, obs_source_t *captured_source,
 		return;
 
 	const uint32_t frames = audio_data->frames;
-	uint32_t stride = 1;
-	const uint32_t per_channel_limit = MAX_SCAN_SAMPLES / (uint32_t)channels;
-
-	if (per_channel_limit > 0 && frames > per_channel_limit)
-		stride = frames / per_channel_limit;
-
-	if (stride == 0)
-		stride = 1;
-
-	float peak = 0.0f;
-	for (size_t channel = 0; channel < channels; channel++) {
-		const float *samples = (const float *)audio_data->data[channel];
-		if (!samples)
-			continue;
-
-		for (uint32_t frame = 0; frame < frames; frame += stride) {
-			const float sample = fabsf(samples[frame]);
-			if (sample > peak)
-				peak = sample;
-		}
-	}
-
-	if (peak <= 0.0f)
-		return;
-
-	peak *= obs_source_get_volume(captured_source);
+	uint32_t bar_count;
+	double sensitivity;
+	double min_frequency;
+	double max_frequency;
+	double noise_floor_db;
 
 	pthread_mutex_lock(&lb->lock);
-	peak = clamp_float((float)(peak * lb->sensitivity), 0.0f, 1.0f);
-	if (peak > lb->current_peak)
-		lb->current_peak = peak;
+	uint32_t configured_interval = lb->update_rate > 0 ? sample_rate / lb->update_rate : sample_rate / 45;
+	if (configured_interval == 0)
+		configured_interval = 1;
+	lb->analysis_frame_accumulator += frames;
+
+	if (lb->analysis_frame_accumulator < configured_interval) {
+		pthread_mutex_unlock(&lb->lock);
+		return;
+	}
+
+	lb->analysis_frame_accumulator -= configured_interval;
+	bar_count = lb->bar_count;
+	sensitivity = lb->sensitivity;
+	min_frequency = lb->min_frequency;
+	max_frequency = lb->max_frequency;
+	noise_floor_db = lb->noise_floor_db;
+	pthread_mutex_unlock(&lb->lock);
+
+	if (min_frequency < 20.0)
+		min_frequency = 20.0;
+	const double nyquist = (double)sample_rate * 0.48;
+	if (max_frequency > nyquist)
+		max_frequency = nyquist;
+	if (max_frequency <= min_frequency)
+		max_frequency = min_frequency * 2.0;
+
+	const uint32_t sample_count = frames > MAX_ANALYSIS_SAMPLES ? MAX_ANALYSIS_SAMPLES : frames;
+	const uint32_t start = frames - sample_count;
+	float mono[MAX_ANALYSIS_SAMPLES];
+	size_t active_channels = 0;
+
+	for (size_t channel = 0; channel < channels; channel++) {
+		if (audio_data->data[channel])
+			active_channels++;
+	}
+
+	if (active_channels == 0)
+		return;
+
+	const float channel_scale = 1.0f / (float)active_channels;
+	const float source_volume = obs_source_get_volume(captured_source);
+
+	for (uint32_t frame = 0; frame < sample_count; frame++) {
+		float mixed = 0.0f;
+
+		for (size_t channel = 0; channel < channels; channel++) {
+			const float *samples = (const float *)audio_data->data[channel];
+			if (samples)
+				mixed += samples[start + frame];
+		}
+
+		mono[frame] = mixed * channel_scale * source_volume;
+	}
+
+	float levels[MAX_BARS];
+	const float log_min = logf((float)min_frequency);
+	const float log_max = logf((float)max_frequency);
+	const float log_range = log_max - log_min;
+
+	for (uint32_t i = 0; i < bar_count; i++) {
+		const float position = bar_count > 1 ? (float)i / (float)(bar_count - 1) : 0.0f;
+		const float frequency = expf(log_min + log_range * position);
+		const float magnitude = goertzel_magnitude(mono, sample_count, frequency, sample_rate);
+
+		levels[i] = magnitude_to_level(magnitude, (float)noise_floor_db, (float)sensitivity);
+	}
+
+	pthread_mutex_lock(&lb->lock);
+	for (uint32_t i = 0; i < bar_count; i++) {
+		if (levels[i] > lb->bars[i])
+			lb->bars[i] = levels[i];
+		if (levels[i] > lb->caps[i])
+			lb->caps[i] = levels[i];
+	}
 	pthread_mutex_unlock(&lb->lock);
 }
 
@@ -348,11 +438,13 @@ static void lightbar_update(void *data, obs_data_t *settings)
 	lb->width = clamp_u32((uint32_t)obs_data_get_int(settings, "width"), 32, 8192);
 	lb->height = clamp_u32((uint32_t)obs_data_get_int(settings, "height"), 16, 8192);
 	lb->bar_count = bar_count;
-	lb->write_index %= lb->bar_count;
 	lb->update_rate = clamp_u32((uint32_t)obs_data_get_int(settings, "update_rate"), 10, 120);
 	lb->sensitivity = obs_data_get_double(settings, "sensitivity");
 	lb->decay = obs_data_get_double(settings, "decay");
 	lb->cap_decay = obs_data_get_double(settings, "cap_decay");
+	lb->min_frequency = obs_data_get_double(settings, "min_frequency");
+	lb->max_frequency = obs_data_get_double(settings, "max_frequency");
+	lb->noise_floor_db = obs_data_get_double(settings, "noise_floor_db");
 	lb->show_background = obs_data_get_bool(settings, "show_background");
 	lb->show_peak_caps = obs_data_get_bool(settings, "show_peak_caps");
 	lb->mirror = obs_data_get_bool(settings, "mirror");
@@ -363,6 +455,12 @@ static void lightbar_update(void *data, obs_data_t *settings)
 		lb->decay = 0.0;
 	if (lb->cap_decay < 0.0)
 		lb->cap_decay = 0.0;
+	if (lb->min_frequency <= 0.0)
+		lb->min_frequency = DEFAULT_MIN_FREQUENCY;
+	if (lb->max_frequency <= lb->min_frequency)
+		lb->max_frequency = DEFAULT_MAX_FREQUENCY;
+	if (lb->noise_floor_db >= -1.0)
+		lb->noise_floor_db = DEFAULT_NOISE_FLOOR_DB;
 
 	rebuild_colors(lb);
 	pthread_mutex_unlock(&lb->lock);
@@ -418,15 +516,6 @@ static void lightbar_hide(void *data)
 	detach_audio_sources(lb);
 }
 
-static void record_peak(struct lightbar_source *lb, float peak)
-{
-	const uint32_t index = lb->write_index % lb->bar_count;
-
-	lb->bars[index] = peak;
-	lb->caps[index] = peak;
-	lb->write_index = (lb->write_index + 1) % lb->bar_count;
-}
-
 static void lightbar_video_tick(void *data, float seconds)
 {
 	struct lightbar_source *lb = data;
@@ -450,26 +539,6 @@ static void lightbar_video_tick(void *data, float seconds)
 		lb->caps[i] = clamp_float(lb->caps[i] - cap_decay_amount, 0.0f, 1.0f);
 		if (lb->caps[i] < lb->bars[i])
 			lb->caps[i] = lb->bars[i];
-	}
-
-	lb->sample_accumulator += seconds;
-	const float sample_interval = 1.0f / (float)lb->update_rate;
-
-	if (lb->sample_accumulator >= sample_interval) {
-		float peak = lb->current_peak;
-		lb->current_peak = 0.0f;
-
-		uint32_t samples_to_write = (uint32_t)(lb->sample_accumulator / sample_interval);
-		if (samples_to_write > 4)
-			samples_to_write = 4;
-
-		record_peak(lb, peak);
-		for (uint32_t i = 1; i < samples_to_write; i++)
-			record_peak(lb, 0.0f);
-
-		lb->sample_accumulator -= sample_interval * (float)samples_to_write;
-		if (lb->sample_accumulator > sample_interval)
-			lb->sample_accumulator = 0.0f;
 	}
 
 	pthread_mutex_unlock(&lb->lock);
@@ -506,7 +575,6 @@ static void lightbar_video_render(void *data, gs_effect_t *effect)
 	float caps[MAX_BARS];
 	struct vec4 colors[MAX_BARS];
 	struct vec4 cap_colors[MAX_BARS];
-	uint32_t write_index;
 	uint32_t bar_count;
 	uint32_t source_width;
 	uint32_t source_height;
@@ -519,7 +587,6 @@ static void lightbar_video_render(void *data, gs_effect_t *effect)
 	memcpy(caps, lb->caps, sizeof(caps));
 	memcpy(colors, lb->colors, sizeof(colors));
 	memcpy(cap_colors, lb->cap_colors, sizeof(cap_colors));
-	write_index = lb->write_index;
 	bar_count = lb->bar_count;
 	source_width = lb->width;
 	source_height = lb->height;
@@ -554,9 +621,8 @@ static void lightbar_video_render(void *data, gs_effect_t *effect)
 	const float center_y = (float)source_height * 0.5f;
 
 	for (uint32_t screen_index = 0; screen_index < bar_count; screen_index++) {
-		const uint32_t ring_index = (write_index + screen_index) % bar_count;
-		const float value = clamp_float(bars[ring_index], 0.0f, 1.0f);
-		const float cap_value = clamp_float(caps[ring_index], 0.0f, 1.0f);
+		const float value = clamp_float(bars[screen_index], 0.0f, 1.0f);
+		const float cap_value = clamp_float(caps[screen_index], 0.0f, 1.0f);
 		const float x = (float)screen_index * (bar_width + gap);
 
 		if (value > 0.001f) {
@@ -625,9 +691,12 @@ static void lightbar_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "height", 220);
 	obs_data_set_default_int(settings, "bar_count", DEFAULT_BARS);
 	obs_data_set_default_int(settings, "update_rate", 45);
-	obs_data_set_default_double(settings, "sensitivity", 1.8);
-	obs_data_set_default_double(settings, "decay", 1.3);
-	obs_data_set_default_double(settings, "cap_decay", 0.55);
+	obs_data_set_default_double(settings, "sensitivity", 1.6);
+	obs_data_set_default_double(settings, "decay", 3.0);
+	obs_data_set_default_double(settings, "cap_decay", 0.85);
+	obs_data_set_default_double(settings, "min_frequency", DEFAULT_MIN_FREQUENCY);
+	obs_data_set_default_double(settings, "max_frequency", DEFAULT_MAX_FREQUENCY);
+	obs_data_set_default_double(settings, "noise_floor_db", DEFAULT_NOISE_FLOOR_DB);
 	obs_data_set_default_bool(settings, "show_background", true);
 	obs_data_set_default_bool(settings, "show_peak_caps", true);
 	obs_data_set_default_bool(settings, "mirror", false);
@@ -652,10 +721,13 @@ static obs_properties_t *lightbar_get_properties(void *data)
 	obs_properties_add_int(props, "width", "Width", 32, 8192, 1);
 	obs_properties_add_int(props, "height", "Height", 16, 8192, 1);
 	obs_properties_add_int_slider(props, "bar_count", "Bars", MIN_BARS, MAX_BARS, 1);
-	obs_properties_add_int_slider(props, "update_rate", "Peak Updates Per Second", 10, 120, 1);
+	obs_properties_add_int_slider(props, "update_rate", "Spectrum Updates Per Second", 10, 120, 1);
 	obs_properties_add_float_slider(props, "sensitivity", "Sensitivity", 0.1, 8.0, 0.1);
 	obs_properties_add_float_slider(props, "decay", "Bar Decay Per Second", 0.0, 6.0, 0.05);
 	obs_properties_add_float_slider(props, "cap_decay", "Peak Cap Decay Per Second", 0.0, 3.0, 0.05);
+	obs_properties_add_float(props, "min_frequency", "Minimum Frequency", 20.0, 2000.0, 1.0);
+	obs_properties_add_float(props, "max_frequency", "Maximum Frequency", 1000.0, 22000.0, 10.0);
+	obs_properties_add_float_slider(props, "noise_floor_db", "Noise Floor dB", -96.0, -24.0, 1.0);
 	obs_properties_add_bool(props, "show_background", "Show Background");
 	obs_properties_add_bool(props, "show_peak_caps", "Show Peak Caps");
 	obs_properties_add_bool(props, "mirror", "Mirror From Center");

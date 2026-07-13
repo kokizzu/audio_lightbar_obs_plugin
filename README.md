@@ -1,20 +1,21 @@
 # Audio Lightbar OBS Plugin
 
-Native OBS source plugin that draws a lightweight rainbow peak lightbar for audio
-currently playing in OBS. Add it to a scene as `Audio Lightbar`, similar to an
-old Winamp-style visualizer.
+Native OBS source plugin that draws a lightweight rainbow spectrum lightbar for
+audio currently playing in OBS. Add it to a scene as `Audio Lightbar`, similar
+to an old Winamp-style visualizer.
 
 ## Features
 
 - Auto mode listens to all current OBS audio sources while the visualizer is
   visible.
 - Optional specific audio source selection.
-- Fixed-size peak buffers: no per-frame heap allocation and no retained audio
-  buffers.
+- Log-spaced frequency bands, defaulting to 60 Hz through 16 kHz.
+- Lightweight Goertzel spectrum analysis with fixed-size buffers: no per-frame
+  heap allocation and no retained audio buffers.
 - Configurable bar count, update rate, sensitivity, decay, peak caps, mirror
-  mode, width, and height.
-- Scans at most 2048 samples per incoming audio block, keeping CPU use bounded
-  even with high channel counts.
+  mode, frequency range, noise floor, width, and height.
+- Analyzes at most 1024 samples per audio update, keeping CPU use bounded even
+  with high channel counts.
 
 ## Build
 
@@ -77,7 +78,9 @@ For distributions using a different OBS plugin directory, copy
 1. Open OBS and choose `Sources` -> `+` -> `Audio Lightbar`.
 2. Leave `Audio Source` as `Auto: all audio sources` to visualize whatever OBS is
    currently playing, or choose a specific source.
-3. Adjust `Bars`, `Peak Updates Per Second`, and `Sensitivity` if needed.
+3. Adjust `Bars`, `Spectrum Updates Per Second`, and `Sensitivity` if needed.
 
-Lower `Bars` and `Peak Updates Per Second` if you want the lowest possible CPU
-use. The defaults are conservative for normal streaming scenes.
+If the bars are still too short, raise `Sensitivity` or move `Noise Floor dB`
+closer to zero, for example from `-72` to `-60`. Lower `Bars` and
+`Spectrum Updates Per Second` if you want the lowest possible CPU use. The
+defaults are conservative for normal streaming scenes.
