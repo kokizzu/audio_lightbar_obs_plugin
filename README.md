@@ -25,14 +25,28 @@ Linux dependencies:
 - CMake 3.16+
 - A C17 compiler
 
+On Debian/Ubuntu/Pop!_OS, install the default dependency set with:
+
+```sh
+make deps
+```
+
+If your distro separates OBS headers from the OBS app, install that development
+package too, for example `libobs-dev`.
+
 Build:
 
 ```sh
-cmake -S . -B build
-cmake --build build
+make build
 ```
 
 The plugin binary will be `build/audio-lightbar.so`.
+
+Build and install for the current OBS user profile:
+
+```sh
+make install
+```
 
 ## Install
 
@@ -41,8 +55,7 @@ The plugin binary will be `build/audio-lightbar.so`.
 Close OBS, then copy the built plugin into OBS' user plugin directory:
 
 ```sh
-mkdir -p ~/.config/obs-studio/plugins/audio-lightbar/bin/64bit
-cp build/audio-lightbar.so ~/.config/obs-studio/plugins/audio-lightbar/bin/64bit/
+make install-user
 ```
 
 Start OBS again.
@@ -53,7 +66,7 @@ If your OBS install loads plugins from `/usr/lib/x86_64-linux-gnu/obs-plugins`,
 you can install system-wide with:
 
 ```sh
-sudo cmake --install build --prefix /usr
+make install-system
 ```
 
 For distributions using a different OBS plugin directory, copy
