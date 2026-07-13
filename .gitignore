@@ -1,0 +1,9 @@
+build/
+core
+core.*
+*.o
+*.so
+*.dylib
+*.dll
+*.pdb
+*.ilk
