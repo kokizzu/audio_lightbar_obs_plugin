@@ -21,8 +21,8 @@ to an old Winamp-style visualizer.
 - Lightweight Goertzel spectrum analysis with fixed-size buffers: no per-frame
   heap allocation and no retained audio buffers.
 - Configurable render style, bar count, brick rows, update rate, sensitivity,
-  decay, peak caps, mirror mode, frequency range, noise floor, rainbow
-  order/orientation, width, and height.
+  decay, peak caps, mirror mode, frequency range, outside-range handling, noise
+  floor, rainbow order/orientation, width, and height.
 - Analyzes at most 1024 samples per audio update, keeping CPU use bounded even
   with high channel counts.
 
@@ -91,9 +91,14 @@ For distributions using a different OBS plugin directory, copy
    the original continuous bars.
 4. Adjust `Bars`, `Brick Rows`, `Spectrum Updates Per Second`, and
    `Sensitivity` if needed. `Brick Rows` is configurable from `10` to `100`.
-5. Use `Lowest Frequency` and `Highest Frequency` to choose which spectrum range
-   fills the bars. Lower `Highest Frequency` if the rightmost bars rarely move.
-6. Enable `Reverse Rainbow Order` for violet-to-red, or `Vertical Rainbow` to
+5. Use `Lowest Frequency (default: 60 Hz)` and `Highest Frequency (default:
+   16 kHz)` to choose which spectrum range fills the bars. Lower `Highest
+   Frequency` if the rightmost bars rarely move.
+6. By default, frequencies below `Lowest Frequency` feed the first bar and
+   frequencies above `Highest Frequency` feed the last bar. Enable
+   `Ignore Outside Frequency Range` to discard those outside frequencies
+   instead.
+7. Enable `Reverse Rainbow Order` for violet-to-red, or `Vertical Rainbow` to
    color bricks by height instead of left-to-right position.
 
 If the bars are still too short, raise `Sensitivity` or move `Noise Floor dB`

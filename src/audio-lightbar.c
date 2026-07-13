@@ -52,6 +52,7 @@ struct lightbar_source {
 	bool mirror;
 	bool reverse_rainbow;
 	bool vertical_rainbow;
+	bool ignore_outside_frequency_range;
 	double sensitivity;
 	double decay;
 	double cap_decay;
@@ -230,6 +231,22 @@ static float magnitude_to_level(float magnitude, float noise_floor_db, float sen
 	return powf(level, 0.72f);
 }
 
+static float max_frequency_probe(const float *samples, uint32_t count, uint32_t sample_rate, float f1, float f2)
+{
+	float magnitude = 0.0f;
+
+	if (f1 > 0.0f)
+		magnitude = goertzel_magnitude(samples, count, f1, sample_rate);
+
+	if (f2 > 0.0f) {
+		const float second = goertzel_magnitude(samples, count, f2, sample_rate);
+		if (second > magnitude)
+			magnitude = second;
+	}
+
+	return magnitude;
+}
+
 static void audio_capture_callback(void *param, obs_source_t *captured_source,
 				   const struct audio_data *audio_data, bool muted)
 {
@@ -259,6 +276,7 @@ static void audio_capture_callback(void *param, obs_source_t *captured_source,
 	double min_frequency;
 	double max_frequency;
 	double noise_floor_db;
+	bool ignore_outside_frequency_range;
 
 	pthread_mutex_lock(&lb->lock);
 	uint32_t configured_interval = lb->update_rate > 0 ? sample_rate / lb->update_rate : sample_rate / 45;
@@ -277,6 +295,7 @@ static void audio_capture_callback(void *param, obs_source_t *captured_source,
 	min_frequency = lb->min_frequency;
 	max_frequency = lb->max_frequency;
 	noise_floor_db = lb->noise_floor_db;
+	ignore_outside_frequency_range = lb->ignore_outside_frequency_range;
 	pthread_mutex_unlock(&lb->lock);
 
 	if (min_frequency < 20.0)
@@ -326,6 +345,34 @@ static void audio_capture_callback(void *param, obs_source_t *captured_source,
 		const float magnitude = goertzel_magnitude(mono, sample_count, frequency, sample_rate);
 
 		levels[i] = magnitude_to_level(magnitude, (float)noise_floor_db, (float)sensitivity);
+	}
+
+	if (!ignore_outside_frequency_range && bar_count > 0) {
+		const float min_freq = (float)min_frequency;
+		const float max_freq = (float)max_frequency;
+		const float low_floor = 20.0f;
+		const float high_ceiling = (float)nyquist;
+
+		if (min_freq > low_floor) {
+			const float low_mid = sqrtf(low_floor * min_freq);
+			const float low_half = fmaxf(low_floor, min_freq * 0.5f);
+			const float magnitude = max_frequency_probe(mono, sample_count, sample_rate, low_mid, low_half);
+			const float level = magnitude_to_level(magnitude, (float)noise_floor_db, (float)sensitivity);
+
+			if (level > levels[0])
+				levels[0] = level;
+		}
+
+		if (max_freq < high_ceiling) {
+			const float high_mid = sqrtf(max_freq * high_ceiling);
+			const float high_next = fminf(high_ceiling, max_freq * 1.5f);
+			const float magnitude =
+				max_frequency_probe(mono, sample_count, sample_rate, high_mid, high_next);
+			const float level = magnitude_to_level(magnitude, (float)noise_floor_db, (float)sensitivity);
+
+			if (level > levels[bar_count - 1])
+				levels[bar_count - 1] = level;
+		}
 	}
 
 	pthread_mutex_lock(&lb->lock);
@@ -468,6 +515,7 @@ static void lightbar_update(void *data, obs_data_t *settings)
 	lb->mirror = obs_data_get_bool(settings, "mirror");
 	lb->reverse_rainbow = obs_data_get_bool(settings, "reverse_rainbow");
 	lb->vertical_rainbow = obs_data_get_bool(settings, "vertical_rainbow");
+	lb->ignore_outside_frequency_range = obs_data_get_bool(settings, "ignore_outside_frequency_range");
 
 	if (lb->sensitivity <= 0.0)
 		lb->sensitivity = 1.0;
@@ -834,6 +882,7 @@ static void lightbar_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "mirror", false);
 	obs_data_set_default_bool(settings, "reverse_rainbow", false);
 	obs_data_set_default_bool(settings, "vertical_rainbow", false);
+	obs_data_set_default_bool(settings, "ignore_outside_frequency_range", false);
 }
 
 static obs_properties_t *lightbar_get_properties(void *data)
@@ -864,9 +913,12 @@ static obs_properties_t *lightbar_get_properties(void *data)
 	obs_properties_add_float_slider(props, "sensitivity", "Sensitivity", 0.1, 8.0, 0.1);
 	obs_properties_add_float_slider(props, "decay", "Bar Decay Per Second", 0.0, 6.0, 0.05);
 	obs_properties_add_float_slider(props, "cap_decay", "Peak Cap Decay Per Second", 0.0, 3.0, 0.05);
-	obs_properties_add_float(props, "min_frequency", "Lowest Frequency", 20.0, 2000.0, 1.0);
-	obs_properties_add_float(props, "max_frequency", "Highest Frequency", 1000.0, 22000.0, 10.0);
+	obs_properties_add_float(props, "min_frequency", "Lowest Frequency (default: 60 Hz)", 20.0, 2000.0, 1.0);
+	obs_properties_add_float(props, "max_frequency", "Highest Frequency (default: 16 kHz)", 1000.0, 22000.0,
+				 10.0);
 	obs_properties_add_float_slider(props, "noise_floor_db", "Noise Floor dB", -96.0, -24.0, 1.0);
+	obs_properties_add_bool(props, "ignore_outside_frequency_range",
+				"Ignore Outside Frequency Range (default: off)");
 	obs_properties_add_bool(props, "show_background", "Show Background");
 	obs_properties_add_bool(props, "show_peak_caps", "Show Peak Caps");
 	obs_properties_add_bool(props, "mirror", "Mirror From Center");
