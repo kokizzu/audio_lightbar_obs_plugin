@@ -16,6 +16,11 @@ OBS_DECLARE_MODULE()
 #define MAX_BARS 256
 #define MIN_BARS 8
 #define DEFAULT_BARS 96
+#define MIN_BRICK_ROWS 10
+#define MAX_BRICK_ROWS 100
+#define DEFAULT_BRICK_ROWS 24
+#define STYLE_BRICK 0
+#define STYLE_SMOOTH 1
 #define ATTACH_REFRESH_SECONDS 2.0f
 #define MAX_ANALYSIS_SAMPLES 1024u
 #define DEFAULT_MIN_FREQUENCY 60.0
@@ -39,10 +44,14 @@ struct lightbar_source {
 	uint32_t width;
 	uint32_t height;
 	uint32_t bar_count;
+	uint32_t brick_rows;
 	uint32_t update_rate;
+	int render_style;
 	bool show_background;
 	bool show_peak_caps;
 	bool mirror;
+	bool reverse_rainbow;
+	bool vertical_rainbow;
 	double sensitivity;
 	double decay;
 	double cap_decay;
@@ -52,8 +61,6 @@ struct lightbar_source {
 
 	float bars[MAX_BARS];
 	float caps[MAX_BARS];
-	struct vec4 colors[MAX_BARS];
-	struct vec4 cap_colors[MAX_BARS];
 	uint32_t analysis_frame_accumulator;
 	float refresh_accumulator;
 };
@@ -126,22 +133,30 @@ static void hsv_to_rgb(float hue, float saturation, float value, struct vec4 *ou
 	out->w = 1.0f;
 }
 
-static void rebuild_colors(struct lightbar_source *lb)
+static void make_rainbow_color(float position, bool reverse, bool peak_cap, struct vec4 *out)
 {
-	const uint32_t count = lb->bar_count > 1 ? lb->bar_count : 1;
+	position = clamp_float(position, 0.0f, 1.0f);
+	if (reverse)
+		position = 1.0f - position;
 
-	for (uint32_t i = 0; i < count; i++) {
-		const float ratio = count > 1 ? (float)i / (float)(count - 1) : 0.0f;
-		const float hue = ratio * 0.84f;
+	hsv_to_rgb(position * 0.84f, 0.95f, 1.0f, out);
 
-		hsv_to_rgb(hue, 0.95f, 1.0f, &lb->colors[i]);
-		lb->colors[i].w = 0.96f;
-
-		lb->cap_colors[i].x = lb->colors[i].x * 0.45f + 0.55f;
-		lb->cap_colors[i].y = lb->colors[i].y * 0.45f + 0.55f;
-		lb->cap_colors[i].z = lb->colors[i].z * 0.45f + 0.55f;
-		lb->cap_colors[i].w = 1.0f;
+	if (peak_cap) {
+		out->x = out->x * 0.45f + 0.55f;
+		out->y = out->y * 0.45f + 0.55f;
+		out->z = out->z * 0.45f + 0.55f;
+		out->w = 1.0f;
+	} else {
+		out->w = 0.96f;
 	}
+}
+
+static float vertical_color_position(float y, float height, float source_height)
+{
+	if (source_height <= 1.0f)
+		return 0.0f;
+
+	return clamp_float(1.0f - ((y + height * 0.5f) / source_height), 0.0f, 1.0f);
 }
 
 static void clear_levels(struct lightbar_source *lb)
@@ -438,7 +453,10 @@ static void lightbar_update(void *data, obs_data_t *settings)
 	lb->width = clamp_u32((uint32_t)obs_data_get_int(settings, "width"), 32, 8192);
 	lb->height = clamp_u32((uint32_t)obs_data_get_int(settings, "height"), 16, 8192);
 	lb->bar_count = bar_count;
+	lb->brick_rows =
+		clamp_u32((uint32_t)obs_data_get_int(settings, "brick_rows"), MIN_BRICK_ROWS, MAX_BRICK_ROWS);
 	lb->update_rate = clamp_u32((uint32_t)obs_data_get_int(settings, "update_rate"), 10, 120);
+	lb->render_style = (int)obs_data_get_int(settings, "render_style");
 	lb->sensitivity = obs_data_get_double(settings, "sensitivity");
 	lb->decay = obs_data_get_double(settings, "decay");
 	lb->cap_decay = obs_data_get_double(settings, "cap_decay");
@@ -448,6 +466,8 @@ static void lightbar_update(void *data, obs_data_t *settings)
 	lb->show_background = obs_data_get_bool(settings, "show_background");
 	lb->show_peak_caps = obs_data_get_bool(settings, "show_peak_caps");
 	lb->mirror = obs_data_get_bool(settings, "mirror");
+	lb->reverse_rainbow = obs_data_get_bool(settings, "reverse_rainbow");
+	lb->vertical_rainbow = obs_data_get_bool(settings, "vertical_rainbow");
 
 	if (lb->sensitivity <= 0.0)
 		lb->sensitivity = 1.0;
@@ -461,8 +481,9 @@ static void lightbar_update(void *data, obs_data_t *settings)
 		lb->max_frequency = DEFAULT_MAX_FREQUENCY;
 	if (lb->noise_floor_db >= -1.0)
 		lb->noise_floor_db = DEFAULT_NOISE_FLOOR_DB;
+	if (lb->render_style != STYLE_SMOOTH)
+		lb->render_style = STYLE_BRICK;
 
-	rebuild_colors(lb);
 	pthread_mutex_unlock(&lb->lock);
 
 	if (obs_source_showing(lb->source))
@@ -558,7 +579,8 @@ static void draw_solid_rect(float x, float y, float width, float height,
 	while (gs_effect_loop(effect, "Solid")) {
 		gs_matrix_push();
 		gs_matrix_translate3f(x, y, 0.0f);
-		gs_draw_sprite(NULL, 0, (uint32_t)ceilf(width), (uint32_t)ceilf(height));
+		gs_matrix_scale3f(width, height, 1.0f);
+		gs_draw_sprite(NULL, 0, 1, 1);
 		gs_matrix_pop();
 	}
 }
@@ -573,26 +595,30 @@ static void lightbar_video_render(void *data, gs_effect_t *effect)
 
 	float bars[MAX_BARS];
 	float caps[MAX_BARS];
-	struct vec4 colors[MAX_BARS];
-	struct vec4 cap_colors[MAX_BARS];
 	uint32_t bar_count;
+	uint32_t brick_rows;
 	uint32_t source_width;
 	uint32_t source_height;
+	int render_style;
 	bool show_background;
 	bool show_peak_caps;
 	bool mirror;
+	bool reverse_rainbow;
+	bool vertical_rainbow;
 
 	pthread_mutex_lock(&lb->lock);
 	memcpy(bars, lb->bars, sizeof(bars));
 	memcpy(caps, lb->caps, sizeof(caps));
-	memcpy(colors, lb->colors, sizeof(colors));
-	memcpy(cap_colors, lb->cap_colors, sizeof(cap_colors));
 	bar_count = lb->bar_count;
+	brick_rows = lb->brick_rows;
 	source_width = lb->width;
 	source_height = lb->height;
+	render_style = lb->render_style;
 	show_background = lb->show_background;
 	show_peak_caps = lb->show_peak_caps;
 	mirror = lb->mirror;
+	reverse_rainbow = lb->reverse_rainbow;
+	vertical_rainbow = lb->vertical_rainbow;
 	pthread_mutex_unlock(&lb->lock);
 
 	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
@@ -616,41 +642,145 @@ static void lightbar_video_render(void *data, gs_effect_t *effect)
 	const float gap = bar_count > 120 ? 1.0f : 2.0f;
 	const float total_gap = gap * (float)(bar_count - 1);
 	const float bar_width = fmaxf(1.0f, ((float)source_width - total_gap) / (float)bar_count);
-	const float cap_height = fmaxf(2.0f, fminf(6.0f, (float)source_height * 0.035f));
 	const float drawable_height = mirror ? ((float)source_height * 0.5f) : (float)source_height;
 	const float center_y = (float)source_height * 0.5f;
+	const bool smooth = render_style == STYLE_SMOOTH;
+	brick_rows = clamp_u32(brick_rows, MIN_BRICK_ROWS, MAX_BRICK_ROWS);
+
+	float brick_gap =
+		(!smooth && brick_rows > 1) ? fmaxf(1.0f, fminf(4.0f, drawable_height * 0.018f)) : 0.0f;
+	float brick_height = (drawable_height - brick_gap * (float)(brick_rows - 1)) / (float)brick_rows;
+	if (brick_height < 1.0f) {
+		brick_gap = 0.0f;
+		brick_height = drawable_height / (float)brick_rows;
+	}
 
 	for (uint32_t screen_index = 0; screen_index < bar_count; screen_index++) {
 		const float value = clamp_float(bars[screen_index], 0.0f, 1.0f);
 		const float cap_value = clamp_float(caps[screen_index], 0.0f, 1.0f);
 		const float x = (float)screen_index * (bar_width + gap);
+		const float horizontal_position =
+			bar_count > 1 ? (float)screen_index / (float)(bar_count - 1) : 0.0f;
+		uint32_t active_rows = (uint32_t)ceilf(value * (float)brick_rows);
 
-		if (value > 0.001f) {
+		if (smooth && !vertical_rainbow) {
+			struct vec4 color;
+			struct vec4 cap_color;
+			const float cap_height = fmaxf(2.0f, fminf(6.0f, (float)source_height * 0.035f));
+
+			make_rainbow_color(horizontal_position, reverse_rainbow, false, &color);
+			make_rainbow_color(horizontal_position, reverse_rainbow, true, &cap_color);
+
+			if (value > 0.001f) {
+				if (mirror) {
+					const float half_height = fmaxf(1.0f, value * drawable_height);
+					draw_solid_rect(x, center_y - half_height, bar_width, half_height, solid,
+							color_param, &color);
+					draw_solid_rect(x, center_y, bar_width, half_height, solid, color_param,
+							&color);
+				} else {
+					const float bar_height = fmaxf(1.0f, value * drawable_height);
+					draw_solid_rect(x, (float)source_height - bar_height, bar_width,
+							bar_height, solid, color_param, &color);
+				}
+			}
+
+			if (show_peak_caps && cap_value > 0.001f) {
+				if (mirror) {
+					const float cap_offset = cap_value * drawable_height;
+					draw_solid_rect(x, center_y - cap_offset - cap_height, bar_width,
+							cap_height, solid, color_param, &cap_color);
+					draw_solid_rect(x, center_y + cap_offset, bar_width, cap_height, solid,
+							color_param, &cap_color);
+				} else {
+					const float cap_y =
+						(float)source_height - (cap_value * drawable_height) - cap_height;
+					draw_solid_rect(x, cap_y, bar_width, cap_height, solid, color_param,
+							&cap_color);
+				}
+			}
+
+			continue;
+		}
+
+		if (active_rows > brick_rows)
+			active_rows = brick_rows;
+
+		for (uint32_t row = 0; row < active_rows; row++) {
 			if (mirror) {
-				const float half_height = fmaxf(1.0f, value * drawable_height);
-				draw_solid_rect(x, center_y - half_height, bar_width, half_height,
-						solid, color_param, &colors[screen_index]);
-				draw_solid_rect(x, center_y, bar_width, half_height, solid, color_param,
-						&colors[screen_index]);
+				const float top_y = center_y - ((float)(row + 1) * brick_height) -
+						    ((float)row * brick_gap);
+				const float bottom_y = center_y + ((float)row * (brick_height + brick_gap));
+				const float top_position = vertical_rainbow
+								   ? vertical_color_position(top_y, brick_height,
+											     (float)source_height)
+								   : horizontal_position;
+				const float bottom_position = vertical_rainbow
+								      ? vertical_color_position(bottom_y, brick_height,
+												(float)source_height)
+								      : horizontal_position;
+				struct vec4 top_color;
+				struct vec4 bottom_color;
+
+				make_rainbow_color(top_position, reverse_rainbow, false, &top_color);
+				make_rainbow_color(bottom_position, reverse_rainbow, false, &bottom_color);
+				draw_solid_rect(x, top_y, bar_width, brick_height, solid, color_param, &top_color);
+				draw_solid_rect(x, bottom_y, bar_width, brick_height, solid, color_param,
+						&bottom_color);
 			} else {
-				const float bar_height = fmaxf(1.0f, value * drawable_height);
-				draw_solid_rect(x, (float)source_height - bar_height, bar_width, bar_height,
-						solid, color_param, &colors[screen_index]);
+				const float y = (float)source_height - ((float)(row + 1) * brick_height) -
+						((float)row * brick_gap);
+				const float color_position = vertical_rainbow
+								     ? vertical_color_position(y, brick_height,
+											       (float)source_height)
+								     : horizontal_position;
+				struct vec4 color;
+
+				make_rainbow_color(color_position, reverse_rainbow, false, &color);
+				draw_solid_rect(x, y, bar_width, brick_height, solid, color_param, &color);
 			}
 		}
 
 		if (show_peak_caps && cap_value > 0.001f) {
+			uint32_t cap_row = (uint32_t)ceilf(cap_value * (float)brick_rows);
+			if (cap_row == 0)
+				cap_row = 1;
+			if (cap_row > brick_rows)
+				cap_row = brick_rows;
+			cap_row--;
+
 			if (mirror) {
-				const float cap_offset = cap_value * drawable_height;
-				draw_solid_rect(x, center_y - cap_offset - cap_height, bar_width, cap_height,
-						solid, color_param, &cap_colors[screen_index]);
-				draw_solid_rect(x, center_y + cap_offset, bar_width, cap_height, solid,
-						color_param, &cap_colors[screen_index]);
+				const float top_y = center_y - ((float)(cap_row + 1) * brick_height) -
+						    ((float)cap_row * brick_gap);
+				const float bottom_y = center_y + ((float)cap_row * (brick_height + brick_gap));
+				const float top_position = vertical_rainbow
+								   ? vertical_color_position(top_y, brick_height,
+											     (float)source_height)
+								   : horizontal_position;
+				const float bottom_position = vertical_rainbow
+								      ? vertical_color_position(bottom_y, brick_height,
+												(float)source_height)
+								      : horizontal_position;
+				struct vec4 top_color;
+				struct vec4 bottom_color;
+
+				make_rainbow_color(top_position, reverse_rainbow, true, &top_color);
+				make_rainbow_color(bottom_position, reverse_rainbow, true, &bottom_color);
+				draw_solid_rect(x, top_y, bar_width, brick_height, solid, color_param, &top_color);
+				draw_solid_rect(x, bottom_y, bar_width, brick_height, solid, color_param,
+						&bottom_color);
 			} else {
-				const float cap_y = (float)source_height - (cap_value * drawable_height) -
-						    cap_height;
-				draw_solid_rect(x, cap_y, bar_width, cap_height, solid, color_param,
-						&cap_colors[screen_index]);
+				const float cap_y = (float)source_height - ((float)(cap_row + 1) * brick_height) -
+						    ((float)cap_row * brick_gap);
+				const float color_position = vertical_rainbow
+								     ? vertical_color_position(cap_y, brick_height,
+											       (float)source_height)
+								     : horizontal_position;
+				struct vec4 cap_color;
+
+				make_rainbow_color(color_position, reverse_rainbow, true, &cap_color);
+				draw_solid_rect(x, cap_y, bar_width, brick_height, solid, color_param,
+						&cap_color);
 			}
 		}
 	}
@@ -690,7 +820,9 @@ static void lightbar_get_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, "width", 900);
 	obs_data_set_default_int(settings, "height", 220);
 	obs_data_set_default_int(settings, "bar_count", DEFAULT_BARS);
+	obs_data_set_default_int(settings, "brick_rows", DEFAULT_BRICK_ROWS);
 	obs_data_set_default_int(settings, "update_rate", 45);
+	obs_data_set_default_int(settings, "render_style", STYLE_BRICK);
 	obs_data_set_default_double(settings, "sensitivity", 1.6);
 	obs_data_set_default_double(settings, "decay", 3.0);
 	obs_data_set_default_double(settings, "cap_decay", 0.85);
@@ -700,6 +832,8 @@ static void lightbar_get_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "show_background", true);
 	obs_data_set_default_bool(settings, "show_peak_caps", true);
 	obs_data_set_default_bool(settings, "mirror", false);
+	obs_data_set_default_bool(settings, "reverse_rainbow", false);
+	obs_data_set_default_bool(settings, "vertical_rainbow", false);
 }
 
 static obs_properties_t *lightbar_get_properties(void *data)
@@ -720,17 +854,24 @@ static obs_properties_t *lightbar_get_properties(void *data)
 
 	obs_properties_add_int(props, "width", "Width", 32, 8192, 1);
 	obs_properties_add_int(props, "height", "Height", 16, 8192, 1);
+	obs_property_t *style_list = obs_properties_add_list(props, "render_style", "Render Style",
+							     OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(style_list, "Stacked Brick", STYLE_BRICK);
+	obs_property_list_add_int(style_list, "Smooth", STYLE_SMOOTH);
 	obs_properties_add_int_slider(props, "bar_count", "Bars", MIN_BARS, MAX_BARS, 1);
+	obs_properties_add_int_slider(props, "brick_rows", "Brick Rows", MIN_BRICK_ROWS, MAX_BRICK_ROWS, 1);
 	obs_properties_add_int_slider(props, "update_rate", "Spectrum Updates Per Second", 10, 120, 1);
 	obs_properties_add_float_slider(props, "sensitivity", "Sensitivity", 0.1, 8.0, 0.1);
 	obs_properties_add_float_slider(props, "decay", "Bar Decay Per Second", 0.0, 6.0, 0.05);
 	obs_properties_add_float_slider(props, "cap_decay", "Peak Cap Decay Per Second", 0.0, 3.0, 0.05);
-	obs_properties_add_float(props, "min_frequency", "Minimum Frequency", 20.0, 2000.0, 1.0);
-	obs_properties_add_float(props, "max_frequency", "Maximum Frequency", 1000.0, 22000.0, 10.0);
+	obs_properties_add_float(props, "min_frequency", "Lowest Frequency", 20.0, 2000.0, 1.0);
+	obs_properties_add_float(props, "max_frequency", "Highest Frequency", 1000.0, 22000.0, 10.0);
 	obs_properties_add_float_slider(props, "noise_floor_db", "Noise Floor dB", -96.0, -24.0, 1.0);
 	obs_properties_add_bool(props, "show_background", "Show Background");
 	obs_properties_add_bool(props, "show_peak_caps", "Show Peak Caps");
 	obs_properties_add_bool(props, "mirror", "Mirror From Center");
+	obs_properties_add_bool(props, "reverse_rainbow", "Reverse Rainbow Order");
+	obs_properties_add_bool(props, "vertical_rainbow", "Vertical Rainbow");
 
 	return props;
 }

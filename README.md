@@ -4,16 +4,25 @@ Native OBS source plugin that draws a lightweight rainbow spectrum lightbar for
 audio currently playing in OBS. Add it to a scene as `Audio Lightbar`, similar
 to an old Winamp-style visualizer.
 
+## Preview
+
+![Audio Lightbar preview](assets/audio-lightbar-preview-1.png)
+
+![Audio Lightbar settings](assets/audio-lightbar-preview-2.png)
+
 ## Features
 
 - Auto mode listens to all current OBS audio sources while the visualizer is
   visible.
 - Optional specific audio source selection.
 - Log-spaced frequency bands, defaulting to 60 Hz through 16 kHz.
+- `Stacked Brick` render style by default, with an optional `Smooth` original
+  bar style.
 - Lightweight Goertzel spectrum analysis with fixed-size buffers: no per-frame
   heap allocation and no retained audio buffers.
-- Configurable bar count, update rate, sensitivity, decay, peak caps, mirror
-  mode, frequency range, noise floor, width, and height.
+- Configurable render style, bar count, brick rows, update rate, sensitivity,
+  decay, peak caps, mirror mode, frequency range, noise floor, rainbow
+  order/orientation, width, and height.
 - Analyzes at most 1024 samples per audio update, keeping CPU use bounded even
   with high channel counts.
 
@@ -78,9 +87,17 @@ For distributions using a different OBS plugin directory, copy
 1. Open OBS and choose `Sources` -> `+` -> `Audio Lightbar`.
 2. Leave `Audio Source` as `Auto: all audio sources` to visualize whatever OBS is
    currently playing, or choose a specific source.
-3. Adjust `Bars`, `Spectrum Updates Per Second`, and `Sensitivity` if needed.
+3. Choose `Render Style`: `Stacked Brick` is the default, and `Smooth` restores
+   the original continuous bars.
+4. Adjust `Bars`, `Brick Rows`, `Spectrum Updates Per Second`, and
+   `Sensitivity` if needed. `Brick Rows` is configurable from `10` to `100`.
+5. Use `Lowest Frequency` and `Highest Frequency` to choose which spectrum range
+   fills the bars. Lower `Highest Frequency` if the rightmost bars rarely move.
+6. Enable `Reverse Rainbow Order` for violet-to-red, or `Vertical Rainbow` to
+   color bricks by height instead of left-to-right position.
 
 If the bars are still too short, raise `Sensitivity` or move `Noise Floor dB`
 closer to zero, for example from `-72` to `-60`. Lower `Bars` and
 `Spectrum Updates Per Second` if you want the lowest possible CPU use. The
-defaults are conservative for normal streaming scenes.
+bars are drawn as brick segments based on the source width and height; resizing
+the OBS scene item scales that brick area in the preview.
