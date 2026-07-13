@@ -6,8 +6,6 @@ to an old Winamp-style visualizer.
 
 ## Preview
 
-![Audio Lightbar preview](assets/audio-lightbar-preview-1.png)
-
 ![Audio Lightbar settings](assets/audio-lightbar-preview-2.png)
 
 ## Features
